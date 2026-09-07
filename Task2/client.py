@@ -1,10 +1,18 @@
 #!/usr/bin/env python3
 """
 MCP client for exercising gateway.py, built on the official SDK's own
-HTTP client transport (mcp.client.streamable_http.streamablehttp_client
+HTTP client transport (mcp.client.streamable_http.streamable_http_client
 + mcp.ClientSession) -- not a raw HTTP request script. Every call this
 script makes is a real MCP protocol exchange; the only thing under
 test is what sits between this client and downstream_server.py.
+
+streamable_http_client is the lower-level of the two client transport
+functions the SDK exports: it takes an already-configured
+httpx.AsyncClient (via http_client=) rather than a headers= shortcut
+-- per its own docstring, "to configure headers, authentication, or
+other HTTP settings, create an httpx.AsyncClient and pass it here." So
+_connect below builds that client itself (with the Authorization
+header baked in) and hands it over.
 
 Points at the GATEWAY's URL, never at downstream_server.py directly --
 that's the whole point: everything here passes through the gateway on
@@ -18,9 +26,11 @@ Usage:
 import argparse
 import asyncio
 import sys
+from contextlib import asynccontextmanager
 
+import httpx
 from mcp import ClientSession
-from mcp.client.streamable_http import streamablehttp_client
+from mcp.client.streamable_http import streamable_http_client
 
 ADMIN_TOKEN = "admin-token-abc123"
 VIEWER_TOKEN = "viewer-token-xyz789"
@@ -36,31 +46,38 @@ def check(label: str, condition: bool, detail: str = "") -> None:
         failures += 1
 
 
+@asynccontextmanager
+async def _connect(gateway_url: str, token: str | None):
+    """Open an MCP session against the gateway, with the given bearer
+    token (or none) attached to every request via the underlying
+    httpx client -- the only way to set headers on this transport."""
+    headers = {"Authorization": f"Bearer {token}"} if token else None
+    async with httpx.AsyncClient(headers=headers) as http_client:
+        async with streamable_http_client(gateway_url, http_client=http_client) as (read, write, _get_session_id):
+            async with ClientSession(read, write) as session:
+                await session.initialize()
+                yield session
+
+
 async def _call(gateway_url: str, token: str | None, name: str, arguments: dict):
     """Returns (result, exception). The exception, if any, must be
-    caught HERE -- inside the nested streamablehttp_client/ClientSession
-    context managers -- rather than letting it propagate out through
-    them uncaught. anyio's task-group teardown (both context managers
-    are backed by one) re-wraps an exception that's still propagating
-    when it exits into an ExceptionGroup; catching it before that
-    unwind starts keeps the original McpError intact and inspectable.
+    caught HERE -- inside the nested _connect/ClientSession context
+    managers -- rather than letting it propagate out through them
+    uncaught. anyio's task-group teardown (both context managers are
+    backed by one) re-wraps an exception that's still propagating when
+    it exits into an ExceptionGroup; catching it before that unwind
+    starts keeps the original McpError intact and inspectable.
     """
-    headers = {"Authorization": f"Bearer {token}"} if token else None
-    async with streamablehttp_client(gateway_url, headers=headers) as (read, write, _get_session_id):
-        async with ClientSession(read, write) as session:
-            await session.initialize()
-            try:
-                return await session.call_tool(name, arguments), None
-            except Exception as exc:
-                return None, exc
+    async with _connect(gateway_url, token) as session:
+        try:
+            return await session.call_tool(name, arguments), None
+        except Exception as exc:
+            return None, exc
 
 
 async def _list_tools(gateway_url: str, token: str | None):
-    headers = {"Authorization": f"Bearer {token}"} if token else None
-    async with streamablehttp_client(gateway_url, headers=headers) as (read, write, _get_session_id):
-        async with ClientSession(read, write) as session:
-            await session.initialize()
-            return await session.list_tools()
+    async with _connect(gateway_url, token) as session:
+        return await session.list_tools()
 
 
 def _text_of(result) -> str:
